@@ -1,0 +1,277 @@
+<?php
+/**
+ * wp_mail pre-send classification integration.
+ *
+ * @package SendRepute
+ */
+
+defined( 'ABSPATH' ) || exit;
+
+final class SendRepute_Mail {
+	const LOCK_PREFIX = 'sendrepute_mail_';
+	const TTL         = 86400;
+
+	/**
+	 * Process-local recursion guard.
+	 *
+	 * @var bool
+	 */
+	private static $active = false;
+
+	/**
+	 * Register after ordinary pre_wp_mail filters, while still respecting them.
+	 *
+	 * @return void
+	 */
+	public static function register() {
+		add_filter( 'pre_wp_mail', array( __CLASS__, 'pre_send' ), PHP_INT_MAX, 2 );
+	}
+
+	/**
+	 * Analyze an email without mutating its recipients, headers, body or files.
+	 *
+	 * A null return preserves the original wp_mail call exactly. False is used
+	 * only when the configured failure or risk policy requires blocking.
+	 *
+	 * @param null|bool $return Previous short-circuit result.
+	 * @param array     $atts   Original wp_mail attributes.
+	 * @return null|bool
+	 */
+	public static function pre_send( $return, $atts ) {
+		if ( null !== $return ) {
+			return $return;
+		}
+
+		$settings = SendRepute_Client::settings();
+		if ( ! self::enabled( $settings, 'enabled' ) || ! self::enabled( $settings, 'paid_consent' ) ) {
+			return null;
+		}
+		if ( self::$active ) {
+			return null;
+		}
+
+		$failure_closed = isset( $settings['failure_policy'] ) && 'closed' === $settings['failure_policy'];
+		$token_identity = SendRepute_Client::token_identity();
+		if ( is_wp_error( $token_identity ) ) {
+			// Credential failures must never reach a decision cached for a
+			// different account or a previously valid token.
+			return $failure_closed ? false : null;
+		}
+		if ( ! is_array( $atts ) || ! isset( $atts['subject'], $atts['message'] ) || ! is_string( $atts['subject'] ) || ! is_string( $atts['message'] ) ) {
+			return $failure_closed ? false : null;
+		}
+
+		$sender  = self::sender_name( isset( $atts['headers'] ) ? $atts['headers'] : array() );
+		$subject = $atts['subject'];
+		$body    = $atts['message'];
+		if ( '' === trim( $sender ) || '' === trim( $subject ) || '' === $body || strlen( $sender ) > 320 || strlen( $subject ) > 998 || strlen( $body ) > 524288 ) {
+			return $failure_closed ? false : null;
+		}
+
+		$request = array(
+			'sender'  => $sender,
+			'subject' => $subject,
+			'body'    => $body,
+		);
+		$models = array( 'thor', 'theos', 'athena', 'odin', 'freya', 'hermes', 'ares', 'apollo' );
+		if ( isset( $settings['model'] ) && in_array( $settings['model'], $models, true ) ) {
+			$request['model'] = $settings['model'];
+		}
+
+		$fingerprint = self::fingerprint( $request, $token_identity );
+		$option_name = self::LOCK_PREFIX . $fingerprint;
+		$now         = time();
+		$state       = get_option( $option_name, null );
+		if ( is_array( $state ) && isset( $state['expires'] ) && (int) $state['expires'] > $now ) {
+			if ( isset( $state['status'] ) && 'complete' === $state['status'] && isset( $state['advisory'] ) && is_array( $state['advisory'] ) ) {
+				return self::apply_policy( $state['advisory'], $settings );
+			}
+			// An in-flight or unknown paid outcome is suppressed for 24 hours.
+			return $failure_closed ? false : null;
+		}
+		if ( is_array( $state ) && isset( $state['expires'] ) && (int) $state['expires'] <= $now ) {
+			// Delete only the exact expired value observed above. A normal
+			// delete_option() check/delete sequence could erase a fresh lock
+			// installed by another process between those two operations.
+			self::delete_expired_lock( $option_name, $state );
+		}
+
+		$lock = array(
+			'status'  => 'pending',
+			'created' => $now,
+			'expires' => $now + self::TTL,
+		);
+		if ( ! add_option( $option_name, $lock, '', 'no' ) ) {
+			// Another request won the atomic lock. Never issue a concurrent paid call.
+			$state = get_option( $option_name, null );
+			if ( is_array( $state ) && isset( $state['status'], $state['advisory'] ) && 'complete' === $state['status'] && is_array( $state['advisory'] ) ) {
+				return self::apply_policy( $state['advisory'], $settings );
+			}
+			return $failure_closed ? false : null;
+		}
+
+		self::$active = true;
+		try {
+			$response = SendRepute_Client::request( 'POST', '/v1/classify', $request );
+		} finally {
+			self::$active = false;
+		}
+		if ( is_wp_error( $response ) ) {
+			$data   = $response->get_error_data();
+			$status = is_array( $data ) && isset( $data['status'] ) ? (int) $data['status'] : 0;
+			if ( $status >= 400 && $status < 500 && 409 !== $status ) {
+				// These responses definitively rejected the request before paid
+				// work. Permit another attempt after the administrator fixes it.
+				delete_option( $option_name );
+			}
+			// Retain the opaque lock for transport, 409, and 5xx outcomes: they
+			// may have happened after charging. The deterministic API key plus
+			// suppression prevents accidental duplicate paid attempts.
+			return $failure_closed ? false : null;
+		}
+
+		$advisory = self::safe_advisory( $response );
+		if ( is_wp_error( $advisory ) ) {
+			return $failure_closed ? false : null;
+		}
+
+		// Persist only non-content policy metadata. Never cache message text,
+		// headers, recipients, attachments, reasons, or flagged terms.
+		update_option(
+			$option_name,
+			array(
+				'status'   => 'complete',
+				'created'  => $now,
+				'expires'  => $now + self::TTL,
+				'advisory' => $advisory,
+			),
+			false
+		);
+
+		return self::apply_policy( $advisory, $settings );
+	}
+
+	/**
+	 * Atomically remove the exact expired lock that was read by this request.
+	 *
+	 * @param string $option_name Lock option name.
+	 * @param array  $state       Expired option value previously observed.
+	 * @return bool Whether that exact row was removed.
+	 */
+	private static function delete_expired_lock( $option_name, $state ) {
+		global $wpdb;
+
+		if ( ! isset( $wpdb, $wpdb->options ) || ! method_exists( $wpdb, 'query' ) || ! method_exists( $wpdb, 'prepare' ) ) {
+			// Production WordPress always supplies wpdb. Refuse a non-atomic
+			// fallback because preserving a newer paid-operation lock is safer.
+			return false;
+		}
+		$deleted = $wpdb->query(
+			$wpdb->prepare(
+				"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
+				$option_name,
+				maybe_serialize( $state )
+			)
+		);
+		if ( 1 === (int) $deleted ) {
+			wp_cache_delete( $option_name, 'options' );
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * @param array  $settings Settings array.
+	 * @param string $key      Setting key.
+	 * @return bool
+	 */
+	private static function enabled( $settings, $key ) {
+		if ( ! isset( $settings[ $key ] ) ) {
+			return false;
+		}
+		return true === $settings[ $key ] || 1 === $settings[ $key ] || '1' === $settings[ $key ] || 'yes' === $settings[ $key ] || 'on' === $settings[ $key ];
+	}
+
+	/**
+	 * Extract only the display name from a From header.
+	 *
+	 * @param string|array $headers wp_mail headers.
+	 * @return string
+	 */
+	private static function sender_name( $headers ) {
+		$lines = is_array( $headers ) ? $headers : preg_split( '/\r\n|\r|\n/', (string) $headers );
+		foreach ( $lines as $line ) {
+			if ( is_string( $line ) && preg_match( '/^\s*From\s*:\s*(.+)$/i', $line, $matches ) ) {
+				$value = trim( $matches[1] );
+				if ( preg_match( '/^(.*?)\s*<[^>]+>\s*$/', $value, $parts ) && '' !== trim( $parts[1], " \t\n\r\0\x0B\"'" ) ) {
+					return trim( $parts[1], " \t\n\r\0\x0B\"'" );
+				}
+			}
+		}
+
+		$name = get_bloginfo( 'name' );
+		return is_string( $name ) && '' !== trim( $name ) ? trim( $name ) : 'WordPress';
+	}
+
+	/**
+	 * Produce an opaque installation-bound fingerprint; message content is not
+	 * recoverable from option names.
+	 *
+	 * @param array  $request        Classification request.
+	 * @param string $token_identity Non-reversible active credential identity.
+	 * @return string
+	 */
+	private static function fingerprint( $request, $token_identity ) {
+		$json = wp_json_encode( $request );
+		$body = false === $json ? serialize( $request ) : $json;
+		return hash_hmac( 'sha256', $token_identity . "\n" . $body, wp_salt( 'nonce' ) );
+	}
+
+	/**
+	 * Reduce an API response to fields needed for local policy decisions.
+	 *
+	 * @param array $response API response.
+	 * @return array|WP_Error
+	 */
+	private static function safe_advisory( $response ) {
+		if ( ! isset( $response['result'] ) || ! is_array( $response['result'] ) ) {
+			return new WP_Error( 'sendrepute_invalid_classification', __( 'The classification response is incomplete.', 'sendrepute' ) );
+		}
+		$result = $response['result'];
+		if ( ! isset( $result['label'], $result['spamProbability'], $result['confidence'] ) ||
+			! in_array( $result['label'], array( 'inbox', 'spam' ), true ) ||
+			! is_numeric( $result['spamProbability'] ) ||
+			(float) $result['spamProbability'] < 0 ||
+			(float) $result['spamProbability'] > 1 ||
+			! in_array( $result['confidence'], array( 'low', 'medium', 'high' ), true )
+		) {
+			return new WP_Error( 'sendrepute_invalid_classification', __( 'The classification response is invalid.', 'sendrepute' ) );
+		}
+
+		return array(
+			'label'            => $result['label'],
+			'spam_probability' => (float) $result['spamProbability'],
+			'confidence'       => $result['confidence'],
+		);
+	}
+
+	/**
+	 * @param array $advisory Safe classification metadata.
+	 * @param array $settings Plugin settings.
+	 * @return null|false
+	 */
+	private static function apply_policy( $advisory, $settings ) {
+update_option( 'sendrepute_last_advisory', array(
+	'label' => $advisory['label'],
+	'probability' => $advisory['spam_probability'],
+	'checked_at' => time(),
+), false );
+		if ( ! isset( $settings['risk_policy'] ) || 'block' !== $settings['risk_policy'] ) {
+			return null;
+		}
+		$threshold = isset( $settings['threshold'] ) && is_numeric( $settings['threshold'] ) ? (float) $settings['threshold'] : 0.8;
+		$threshold = max( 0.0, min( 1.0, $threshold ) );
+
+		return $advisory['spam_probability'] >= $threshold ? false : null;
+	}
+}
