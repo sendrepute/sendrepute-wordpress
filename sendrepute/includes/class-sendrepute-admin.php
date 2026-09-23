@@ -104,6 +104,23 @@ wp_die( esc_html__( 'You are not allowed to manage SendRepute.', 'sendrepute' ),
 						</td>
 					</tr>
 					<tr>
+						<th scope="row"><?php echo esc_html__( 'WooCommerce email analysis', 'sendrepute' ); ?></th>
+						<td>
+							<label><input type="checkbox" name="woocommerce_enabled" value="1" <?php checked( self::truthy( $settings, 'woocommerce_enabled' ) ); ?>> <?php echo esc_html__( 'Analyze only the selected WooCommerce email types', 'sendrepute' ); ?></label>
+							<p class="description"><?php echo esc_html__( 'Off by default. When off, WooCommerce mail bypasses SendRepute even if general classification is enabled. Extension-defined email types are not selected automatically.', 'sendrepute' ); ?></p>
+							<fieldset>
+								<legend class="screen-reader-text"><?php echo esc_html__( 'WooCommerce email types', 'sendrepute' ); ?></legend>
+								<?php
+								$woocommerce_selected = isset( $settings['woocommerce_types'] ) && is_array( $settings['woocommerce_types'] ) ? $settings['woocommerce_types'] : array();
+								foreach ( SendRepute_WooCommerce::email_types() as $email_id => $label ) :
+									?>
+									<label style="display:block"><input type="checkbox" name="woocommerce_types[]" value="<?php echo esc_attr( $email_id ); ?>" <?php checked( in_array( $email_id, $woocommerce_selected, true ) ); ?>> <?php echo esc_html( $label ); ?></label>
+								<?php endforeach; ?>
+							</fieldset>
+							<p class="description"><strong><?php echo esc_html__( 'Safety boundary:', 'sendrepute' ); ?></strong> <?php echo esc_html__( 'Customer authentication, payment, invoice, note and order-status email types marked protected are never blocked by risk, API failure, or unsupported-content policy. Unselected mail is never analyzed. WooCommerce multipart mail is not partially analyzed: it is allowed in advisory/fail-open mode and rejected only for explicitly selected, non-protected mail under fail-closed mode.', 'sendrepute' ); ?></p>
+						</td>
+					</tr>
+					<tr>
 						<th scope="row"><label for="sendrepute-failure"><?php echo esc_html__( 'API failure policy', 'sendrepute' ); ?></label></th>
 						<td><select id="sendrepute-failure" name="failure_policy">
 							<option value="open" <?php selected( isset( $settings['failure_policy'] ) ? $settings['failure_policy'] : '', 'open' ); ?>><?php echo esc_html__( 'Open — allow mail when analysis fails', 'sendrepute' ); ?></option>
@@ -169,6 +186,10 @@ wp_die( esc_html__( 'You are not allowed to manage SendRepute.', 'sendrepute' ),
 			$model = '';
 		}
 $consent = isset( $_POST['paid_consent'] );
+		$woocommerce_types = isset( $_POST['woocommerce_types'] ) && is_array( $_POST['woocommerce_types'] )
+			? array_map( 'sanitize_key', wp_unslash( $_POST['woocommerce_types'] ) )
+			: array();
+		$woocommerce_types = array_values( array_intersect( array_keys( SendRepute_WooCommerce::email_types() ), array_unique( $woocommerce_types ) ) );
 		$stored  = array(
 			'enabled'        => isset( $_POST['enabled'] ),
 			'paid_consent'   => $consent,
@@ -177,6 +198,8 @@ $consent = isset( $_POST['paid_consent'] );
 			'threshold'      => max( 0, min( 1, $threshold ) ),
 			'model'          => $model,
 			'retain_data'    => isset( $_POST['retain_data'] ),
+			'woocommerce_enabled' => isset( $_POST['woocommerce_enabled'] ),
+			'woocommerce_types'   => $woocommerce_types,
 		);
 		update_option( 'sendrepute_settings', $stored, false );
 

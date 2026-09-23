@@ -4,6 +4,7 @@ vendor/
 .env.*
 .npmrc
 *.zip
+!tests/fixtures/releases/sendrepute-0.1.0.zip
 *.log
 __pycache__/
 *.pyc

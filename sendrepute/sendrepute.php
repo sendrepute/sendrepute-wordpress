@@ -2,7 +2,7 @@
 /**
  * Plugin Name: SendRepute
  * Description: Optional paid pre-send email analysis and explicit manual AI tools. Does not send email or guarantee delivery.
- * Version: 0.1.0
+ * Version: 0.2.0
  * Requires at least: 5.7
  * Requires PHP: 7.4
  * Author: SendRepute
@@ -14,8 +14,10 @@ defined( 'ABSPATH' ) || exit;
 // Fixed canonical HTTPS destination: credentials must never follow redirects.
 define( 'SENDREPUTE_API_BASE', 'https://www.sendrepute.com/api' );
 require_once __DIR__ . '/includes/class-sendrepute-client.php';
+require_once __DIR__ . '/includes/class-sendrepute-woocommerce.php';
 require_once __DIR__ . '/includes/class-sendrepute-mail.php';
 require_once __DIR__ . '/includes/class-sendrepute-admin.php';
+SendRepute_WooCommerce::register();
 SendRepute_Mail::register();
 SendRepute_Admin::register();
 

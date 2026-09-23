@@ -10,6 +10,7 @@ defined( 'ABSPATH' ) || exit;
 final class SendRepute_Client {
 	const SETTINGS_OPTION = 'sendrepute_settings';
 	const TOKEN_OPTION    = 'sendrepute_token';
+	const MAX_RESPONSE_BYTES = 1048576;
 
 	/**
 	 * Return the plugin settings without ever mixing in the API token.
@@ -25,6 +26,8 @@ final class SendRepute_Client {
 			'threshold'      => 0.8,
 			'model'          => '',
 			'retain_data'    => false,
+			'woocommerce_enabled' => false,
+			'woocommerce_types'   => array(),
 		);
 		$stored = get_option( self::SETTINGS_OPTION, array() );
 		$stored = is_array( $stored ) ? array_intersect_key( $stored, $defaults ) : array();
@@ -195,6 +198,9 @@ final class SendRepute_Client {
 			'timeout'     => 20,
 			'redirection' => 0,
 			'sslverify'   => true,
+			// Ask WordPress to retain one byte past our accepted maximum so a
+			// truncated/oversized response is distinguishable from an exact fit.
+			'limit_response_size' => self::MAX_RESPONSE_BYTES + 1,
 		);
 		if ( null !== $body ) {
 			if ( ! is_array( $body ) ) {
@@ -215,6 +221,12 @@ final class SendRepute_Client {
 
 		$status  = (int) wp_remote_retrieve_response_code( $response );
 		$raw     = wp_remote_retrieve_body( $response );
+		$content_length = wp_remote_retrieve_header( $response, 'content-length' );
+		if ( strlen( $raw ) > self::MAX_RESPONSE_BYTES ||
+			( is_scalar( $content_length ) && ctype_digit( trim( (string) $content_length ) ) && (int) $content_length > self::MAX_RESPONSE_BYTES )
+		) {
+			return new WP_Error( 'sendrepute_response_too_large', __( 'The SendRepute API response exceeded the safe size limit.', 'sendrepute' ), array( 'status' => $status ) );
+		}
 		$decoded = json_decode( $raw, true );
 		if ( $status < 200 || $status >= 300 ) {
 			$message = __( 'The SendRepute API rejected the request.', 'sendrepute' );

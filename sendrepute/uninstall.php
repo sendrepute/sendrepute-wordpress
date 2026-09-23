@@ -11,6 +11,7 @@ function sendrepute_uninstall_site() {
 	if ( ! empty( $settings['retain_data'] ) ) {
 		$settings['enabled'] = false;
 		$settings['paid_consent'] = false;
+$settings['woocommerce_enabled'] = false;
 		update_option( 'sendrepute_settings', $settings, false );
 		return;
 	}
