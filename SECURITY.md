@@ -10,9 +10,16 @@ Keep WordPress, PHP and SMTP plugins supported and updated. Store API keys only
 in private server configuration or the encrypted settings field. Protect salts
 and backups. Enable paid analysis explicitly and test fail-open/fail-closed
 behavior on critical mail. Classification is not a delivery guarantee.
+Classification consent binds all four effective rates and an explicit
+per-request maximum. The server checks both during settlement; the adapter does
+not turn a `PRICE_CHANGED` refusal into raised-price consent and blocks that
+delivery even in fail-open mode. Keep a cumulative cap on the API key as a
+separate safeguard.
 
 WooCommerce analysis is independently disabled by default. Selected protected
-customer mail can be analyzed but cannot be blocked by SendRepute. Multipart
+customer mail can be analyzed but is not blocked by risk, ordinary API failure,
+or unsupported content. `PRICE_CHANGED` is the billing-consent exception and
+blocks selected delivery rather than accepting a new tariff. Multipart
 WooCommerce mail is never classified from only one displayed alternative:
 unsupported selected mail follows fail-open/fail-closed policy without a paid
 request, while protected customer mail continues. The callback wrapper retains

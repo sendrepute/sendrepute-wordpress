@@ -44,7 +44,9 @@ Configuration is stored per site in the non-autoloaded
 `sendrepute_settings` option. Its WooCommerce keys are
 `woocommerce_enabled` (boolean, default `false`) and `woocommerce_types`
 (allowlisted email-ID array, default empty). `enabled` and `paid_consent` are
-also both false by default and remain required. The encrypted credential is
+also both false by default and remain required. Paid consent stores the exact
+four-field effective classification schedule plus an explicit per-request
+maximum; it is not a fixed final quote. The encrypted credential is
 stored separately in the non-autoloaded `sendrepute_token` option, unless the
 private `SENDREPUTE_API_TOKEN` constant is defined. These option names and the
 constant are the supported operator-facing integration points; internal class
@@ -59,7 +61,18 @@ You may instead set `SENDREPUTE_API_TOKEN` in private server configuration.
 Do not commit keys, expose them to browsers, or paste them in support issues.
 
 Enable analysis and separately confirm paid consent before enabling the mail
-hook. Start with advisory mode. Blocking mode compares the returned score with
+hook. Review all four authenticated tariff fields and choose the maximum actual
+charge permitted for each new request. They are sent as `priceAuthorization`;
+the API checks current effective rates and the computed charge atomically at
+settlement. `PRICE_CHANGED` is never retried or accepted automatically and
+blocks that delivery even under fail-open. Refresh the settings page and
+deliberately save new consent. This per-request authorization does not replace
+the API key's cumulative spending cap. Exact completed receipt replays remain
+free, and authorization is excluded from content/model replay identity.
+Consent is bound to the active credential identity; rotating the API key
+requires reviewing and saving consent again. Local replay locks are likewise
+credential-scoped.
+Start with advisory mode. Blocking mode compares the returned score with
 your threshold; choose fail-open or fail-closed deliberately. Test critical
 transactional mail before enabling blocking. A blocked `wp_mail` returns false;
 the plugin does not queue or retry the send. WordPress-generated password
@@ -72,7 +85,9 @@ WooCommerce support is a separate administrator opt-in on the same settings
 page and is off by default. Select individual built-in WooCommerce email types;
 unselected and extension-defined types bypass analysis. Customer authentication,
 payment, invoice, note and order-status types marked **protected** may be
-analyzed when selected but are never blocked by this adapter. WooCommerce
+analyzed when selected but are not blocked by risk, ordinary API failure, or
+unsupported content. The billing-consent exception is `PRICE_CHANGED`, which
+blocks any selected delivery rather than accepting a new tariff. WooCommerce
 multipart messages are not approved from only one alternative: no paid request
 is made, fail-open/advisory continues, and fail-closed blocks only selected,
 non-protected types.

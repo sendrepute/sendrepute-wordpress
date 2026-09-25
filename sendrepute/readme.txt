@@ -16,6 +16,12 @@ Upload sendrepute-0.2.0.zip in Plugins > Add New > Upload Plugin. Activate it,
 then open Settings > SendRepute. Analysis is disabled by default. Configure a
 scoped customer token and run the non-paid connection check. Review the current
 classification tariff and explicitly consent before enabling analysis.
+Consent records all four effective rate fields and an explicit maximum actual
+charge for each new classification; this variable tariff is not a fixed quote.
+The API checks both at settlement. PRICE_CHANGED is never retried or accepted
+automatically and blocks that delivery even with fail-open selected. Review the
+new tariff and save fresh consent. Per-request authorization remains separate
+from cumulative API-key spending caps. Exact completed receipt replays stay free.
 Minimum scopes: classify, account:read, catalog:read. Manual AI price display
 also requires vip:read; rewrite requires rewrite; template generation requires
 ai:generate, with an active VIP membership for VIP generation. Keep spend caps
@@ -87,9 +93,11 @@ nested inside a Woo callback, the mismatch bypasses analysis and never falls
 back to ordinary paid classification.
 
 Customer authentication, payment, invoice, note, and order-status types marked
-protected in the UI are never blocked by SendRepute, including password reset
-and new-account access mail. Selection permits advisory analysis; it does not
-permit blocking those messages. WooCommerce builds multipart AltBody later at
+protected in the UI are not blocked by risk, ordinary API failure, or
+unsupported content, including password reset and new-account access mail.
+The billing-consent exception is PRICE_CHANGED, which blocks any selected
+delivery rather than authorizing a new tariff. Selection otherwise permits
+advisory analysis; it does not permit blocking those messages. WooCommerce builds multipart AltBody later at
 phpmailer_init, after pre_wp_mail. SendRepute therefore never approves or pays
 for multipart mail based on HTML alone: selected non-protected multipart mail
 continues under fail-open/advisory and returns false under fail-closed; protected

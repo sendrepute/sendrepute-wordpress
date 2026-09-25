@@ -54,7 +54,8 @@ wp_die( esc_html__( 'You are not allowed to manage SendRepute.', 'sendrepute' ),
 
 		$settings = SendRepute_Client::settings();
 		$token    = SendRepute_Client::token();
-		$pricing  = self::price_state();
+		$classification_state = self::classification_price_state();
+		$pricing  = self::price_state( $classification_state );
 		?>
 		<div class="wrap">
 			<h1><?php echo esc_html__( 'SendRepute', 'sendrepute' ); ?></h1>
@@ -99,8 +100,16 @@ wp_die( esc_html__( 'You are not allowed to manage SendRepute.', 'sendrepute' ),
 						<th scope="row"><?php echo esc_html__( 'Automatic classification', 'sendrepute' ); ?></th>
 						<td>
 							<label><input type="checkbox" name="enabled" value="1" <?php checked( self::truthy( $settings, 'enabled' ) ); ?>> <?php echo esc_html__( 'Enable pre-send classification', 'sendrepute' ); ?></label><br>
-<label><input type="checkbox" name="paid_consent" value="1" <?php checked( self::truthy( $settings, 'paid_consent' ) ); ?>> <?php echo esc_html__( 'I consent to sending email content and to the account being charged for each uncached classification.', 'sendrepute' ); ?></label>
-							<p class="description"><?php echo esc_html__( 'This consent applies only to classification. AI tools below require a separate confirmation every time. SendRepute never sends the email.', 'sendrepute' ); ?></p>
+							<?php if ( is_wp_error( $classification_state ) ) : ?>
+								<p class="description"><?php echo esc_html__( 'Paid classification consent is unavailable until the current authenticated tariff can be verified.', 'sendrepute' ); ?></p>
+							<?php else : ?>
+								<?php $classification_pricing = self::classification_pricing( $classification_state ); ?>
+								<input type="hidden" name="classification_price_state" value="<?php echo esc_attr( self::classification_price_digest( $classification_state ) ); ?>">
+								<p class="description"><?php echo esc_html( sprintf( __( 'Current effective tariff: base %1$s, %2$d included unique terms, %3$s per additional term, service maximum %4$s.', 'sendrepute' ), self::money( $classification_pricing['classificationBaseMillicents'] ), $classification_pricing['includedUniqueTerms'], self::money( $classification_pricing['additionalTermMillicents'] ), self::money( $classification_pricing['maximumClassificationMillicents'] ) ) ); ?></p>
+								<label><?php echo esc_html__( 'Maximum charge authorized per new classification (millicents)', 'sendrepute' ); ?> <input type="number" min="0" max="<?php echo esc_attr( $classification_pricing['maximumClassificationMillicents'] ); ?>" step="1" name="classification_max_charge_millicents" value="<?php echo esc_attr( self::classification_maximum_value( $settings, $classification_pricing ) ); ?>"></label><br>
+								<label><input type="checkbox" name="paid_consent" value="1" <?php checked( self::truthy( $settings, 'paid_consent' ) ); ?>> <?php echo esc_html__( 'I consent to sending email content and authorize the exact four-field tariff shown above, up to my per-request maximum.', 'sendrepute' ); ?></label>
+							<?php endif; ?>
+							<p class="description"><?php echo esc_html__( 'Tariff changes are never accepted automatically. A PRICE_CHANGED refusal blocks that delivery even in fail-open mode; review and save fresh consent. API-key cumulative spending caps remain separate. This consent applies only to classification.', 'sendrepute' ); ?></p>
 						</td>
 					</tr>
 					<tr>
@@ -117,7 +126,7 @@ wp_die( esc_html__( 'You are not allowed to manage SendRepute.', 'sendrepute' ),
 									<label style="display:block"><input type="checkbox" name="woocommerce_types[]" value="<?php echo esc_attr( $email_id ); ?>" <?php checked( in_array( $email_id, $woocommerce_selected, true ) ); ?>> <?php echo esc_html( $label ); ?></label>
 								<?php endforeach; ?>
 							</fieldset>
-							<p class="description"><strong><?php echo esc_html__( 'Safety boundary:', 'sendrepute' ); ?></strong> <?php echo esc_html__( 'Customer authentication, payment, invoice, note and order-status email types marked protected are never blocked by risk, API failure, or unsupported-content policy. Unselected mail is never analyzed. WooCommerce multipart mail is not partially analyzed: it is allowed in advisory/fail-open mode and rejected only for explicitly selected, non-protected mail under fail-closed mode.', 'sendrepute' ); ?></p>
+<p class="description"><strong><?php echo esc_html__( 'Safety boundary:', 'sendrepute' ); ?></strong> <?php echo esc_html__( 'Customer authentication, payment, invoice, note and order-status email types marked protected are never blocked by risk, ordinary API failure, or unsupported-content policy. A billing-consent PRICE_CHANGED refusal blocks any selected delivery rather than accepting a new tariff. Unselected mail is never analyzed. WooCommerce multipart mail is not partially analyzed: it is allowed in advisory/fail-open mode and rejected only for explicitly selected, non-protected mail under fail-closed mode.', 'sendrepute' ); ?></p>
 						</td>
 					</tr>
 					<tr>
@@ -162,7 +171,7 @@ wp_die( esc_html__( 'You are not allowed to manage SendRepute.', 'sendrepute' ),
 				<?php submit_button( __( 'Check connection and non-paid scopes', 'sendrepute' ), 'secondary', 'submit', false ); ?>
 			</form>
 
-			<?php self::render_connection( $token, $pricing ); ?>
+			<?php self::render_connection( $token, $classification_state ); ?>
 			<hr>
 			<h2><?php echo esc_html__( 'Manual AI actions', 'sendrepute' ); ?></h2>
 			<p><?php echo esc_html__( 'Nothing below runs automatically, changes WordPress content, or sends email. Each submission is a paid API request and requires explicit permission and consent. The API server is the final authority for key scopes, VIP status, price, balance, and replay behavior.', 'sendrepute' ); ?></p>
@@ -185,7 +194,29 @@ wp_die( esc_html__( 'You are not allowed to manage SendRepute.', 'sendrepute' ),
 		if ( ! in_array( $model, array( '', 'thor', 'theos', 'athena', 'odin', 'freya', 'hermes', 'ares', 'apollo' ), true ) ) {
 			$model = '';
 		}
-$consent = isset( $_POST['paid_consent'] );
+		$consent        = false;
+		$consent_prices = array();
+		$consent_maximum = -1;
+		$consent_token_identity = '';
+		$credential_change = ! defined( 'SENDREPUTE_API_TOKEN' ) &&
+			( isset( $_POST['remove_token'] ) || ( isset( $_POST['api_token'] ) && '' !== trim( wp_unslash( $_POST['api_token'] ) ) ) );
+		if ( ! $credential_change && isset( $_POST['paid_consent'], $_POST['classification_price_state'], $_POST['classification_max_charge_millicents'] ) ) {
+			$current = self::classification_price_state();
+			$maximum = wp_unslash( $_POST['classification_max_charge_millicents'] );
+			$token_identity = SendRepute_Client::token_identity();
+			if ( ! is_wp_error( $current ) &&
+				! is_wp_error( $token_identity ) &&
+				is_string( $maximum ) &&
+				ctype_digit( $maximum ) &&
+				(int) $maximum <= self::classification_pricing( $current )['maximumClassificationMillicents'] &&
+				hash_equals( self::classification_price_digest( $current ), sanitize_text_field( wp_unslash( $_POST['classification_price_state'] ) ) )
+			) {
+				$consent         = true;
+				$consent_prices  = self::classification_pricing( $current );
+				$consent_maximum = (int) $maximum;
+				$consent_token_identity = $token_identity;
+			}
+		}
 		$woocommerce_types = isset( $_POST['woocommerce_types'] ) && is_array( $_POST['woocommerce_types'] )
 			? array_map( 'sanitize_key', wp_unslash( $_POST['woocommerce_types'] ) )
 			: array();
@@ -193,6 +224,9 @@ $consent = isset( $_POST['paid_consent'] );
 		$stored  = array(
 			'enabled'        => isset( $_POST['enabled'] ),
 			'paid_consent'   => $consent,
+			'classification_pricing' => $consent_prices,
+			'classification_max_charge_millicents' => $consent_maximum,
+			'classification_consent_token_identity' => $consent_token_identity,
 			'failure_policy' => $failure_policy,
 			'risk_policy'    => $risk_policy,
 			'threshold'      => max( 0, min( 1, $threshold ) ),
@@ -302,7 +336,7 @@ $consent = isset( $_POST['paid_consent'] );
 	 * Render current account/scope information.
 	 *
 	 * @param string|WP_Error $token Token state.
-	 * @param array|WP_Error  $pricing Price state.
+	 * @param array|WP_Error  $pricing Classification account/pricing state.
 	 * @return void
 	 */
 	private static function render_connection( $token, $pricing ) {
@@ -317,7 +351,7 @@ $consent = isset( $_POST['paid_consent'] );
 			return;
 		}
 		$username = isset( $pricing['account']['username'] ) ? $pricing['account']['username'] : '';
-		echo '<p>' . esc_html( sprintf( __( 'Connected as %s. Verified by non-paid calls: account:read, catalog:read, vip:read.', 'sendrepute' ), $username ) ) . '</p>';
+		echo '<p>' . esc_html( sprintf( __( 'Connected as %s. Verified by non-paid calls: account:read, catalog:read.', 'sendrepute' ), $username ) ) . '</p>';
 $reported_scopes = array();
 if ( isset( $pricing['account']['scopes'] ) && is_array( $pricing['account']['scopes'] ) ) {
 $reported_scopes = $pricing['account']['scopes'];
@@ -418,14 +452,33 @@ echo '<p>' . esc_html( sprintf( __( 'API-reported key scopes: %s.', 'sendrepute'
 	}
 
 	/**
-	 * Fetch all non-paid data needed to state effective account prices.
+	 * Fetch account and classification pricing without requiring VIP access.
 	 *
 	 * @return array|WP_Error
 	 */
-	private static function price_state() {
+	private static function classification_price_state() {
 		$connection = SendRepute_Client::connection();
 		if ( is_wp_error( $connection ) ) {
 			return $connection;
+		}
+		return array(
+			'account' => $connection['account'],
+			'pricing' => $connection['pricing'],
+		);
+	}
+
+	/**
+	 * Fetch VIP-only data needed by the manual AI controls.
+	 *
+	 * @param array|WP_Error|null $classification_state Optional verified account/pricing state.
+	 * @return array|WP_Error
+	 */
+	private static function price_state( $classification_state = null ) {
+		if ( null === $classification_state ) {
+			$classification_state = self::classification_price_state();
+		}
+		if ( is_wp_error( $classification_state ) ) {
+			return $classification_state;
 		}
 		$vip = SendRepute_Client::request( 'GET', '/v1/vip' );
 		if ( is_wp_error( $vip ) ) {
@@ -445,8 +498,8 @@ echo '<p>' . esc_html( sprintf( __( 'API-reported key scopes: %s.', 'sendrepute'
 			return new WP_Error( 'sendrepute_invalid_vip_pricing', __( 'The API returned invalid effective AI pricing.', 'sendrepute' ) );
 		}
 		return array(
-			'account' => $connection['account'],
-			'pricing' => $connection['pricing'],
+			'account' => $classification_state['account'],
+			'pricing' => $classification_state['pricing'],
 			'vip'     => $vip,
 		);
 	}
@@ -464,6 +517,54 @@ echo '<p>' . esc_html( sprintf( __( 'API-reported key scopes: %s.', 'sendrepute'
 			'ai_term_minimum'   => isset( $state['pricing']['aiMinimumPerUniqueTermMillicents'] ) ? (int) $state['pricing']['aiMinimumPerUniqueTermMillicents'] : -1,
 		);
 		return hash_hmac( 'sha256', wp_json_encode( $snapshot ), wp_salt( 'nonce' ) );
+	}
+
+	/**
+	 * Return the exact effective classification schedule in public API order.
+	 *
+	 * @param array $state Verified price state.
+	 * @return array
+	 */
+	private static function classification_pricing( $state ) {
+		return array(
+			'classificationBaseMillicents'    => (int) $state['pricing']['classificationBaseMillicents'],
+			'includedUniqueTerms'             => (int) $state['pricing']['includedUniqueTerms'],
+			'additionalTermMillicents'        => (int) $state['pricing']['additionalTermMillicents'],
+			'maximumClassificationMillicents' => (int) $state['pricing']['maximumClassificationMillicents'],
+		);
+	}
+
+	/**
+	 * Bind saved classification consent to the account and all four rates.
+	 *
+	 * @param array $state Verified price state.
+	 * @return string
+	 */
+	private static function classification_price_digest( $state ) {
+		$snapshot = array(
+			'account_id' => isset( $state['account']['id'] ) ? (string) $state['account']['id'] : '',
+			'pricing'    => self::classification_pricing( $state ),
+		);
+		return hash_hmac( 'sha256', wp_json_encode( $snapshot ), wp_salt( 'nonce' ) );
+	}
+
+	/**
+	 * Retain an existing deliberate ceiling only for an identical schedule.
+	 *
+	 * @param array $settings Current settings.
+	 * @param array $pricing  Current effective pricing.
+	 * @return int
+	 */
+	private static function classification_maximum_value( $settings, $pricing ) {
+		if ( isset( $settings['classification_pricing'], $settings['classification_max_charge_millicents'] ) &&
+			$settings['classification_pricing'] === $pricing &&
+			is_int( $settings['classification_max_charge_millicents'] ) &&
+			$settings['classification_max_charge_millicents'] >= 0 &&
+			$settings['classification_max_charge_millicents'] <= $pricing['maximumClassificationMillicents']
+		) {
+			return $settings['classification_max_charge_millicents'];
+		}
+		return $pricing['maximumClassificationMillicents'];
 	}
 
 	/**

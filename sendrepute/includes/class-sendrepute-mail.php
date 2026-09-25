@@ -103,6 +103,15 @@ final class SendRepute_Mail {
 			// different account or a previously valid token.
 			return self::failure_result( $settings, $protected );
 		}
+		$price_authorization = self::price_authorization( $settings, $token_identity );
+		if ( is_wp_error( $price_authorization ) ) {
+			// Enabling analysis is not authorization to invent or refresh a
+			// tariff or transfer consent to a replacement credential. Legacy
+			// enabled settings are treated as an unavailable local preflight,
+			// not as a server PRICE_CHANGED billing refusal.
+			return self::failure_result( $settings, $protected );
+		}
+		$authorization_digest = hash_hmac( 'sha256', wp_json_encode( $price_authorization ), wp_salt( 'nonce' ) );
 		if ( ! is_array( $atts ) || ! isset( $atts['subject'], $atts['message'] ) || ! is_string( $atts['subject'] ) || ! is_string( $atts['message'] ) ) {
 			return self::failure_result( $settings, $protected );
 		}
@@ -124,6 +133,9 @@ final class SendRepute_Mail {
 			$request['model'] = $settings['model'];
 		}
 
+		// Keep authorization outside the replay/cache identity. The public API
+		// likewise excludes it from its content/model fingerprint, so an exact
+		// completed replay remains free after consent or pricing changes.
 		$fingerprint = self::fingerprint( $request, $token_identity );
 		$option_name = self::LOCK_PREFIX . $fingerprint;
 		$now         = time();
@@ -132,8 +144,19 @@ final class SendRepute_Mail {
 			if ( isset( $state['status'] ) && 'complete' === $state['status'] && isset( $state['advisory'] ) && is_array( $state['advisory'] ) ) {
 				return self::apply_policy( $state['advisory'], $settings, $protected );
 			}
+			if ( isset( $state['status'], $state['authorization'] ) && 'price_changed' === $state['status'] ) {
+				if ( hash_equals( (string) $state['authorization'], $authorization_digest ) ) {
+					return false;
+				}
+				// A deliberate new authorization may retry the same content.
+				// Compare-delete preserves a concurrently installed paid lock.
+				self::delete_expired_lock( $option_name, $state );
+				$state = get_option( $option_name, null );
+			}
 			// An in-flight or unknown paid outcome is suppressed for 24 hours.
-			return $protected ? null : ( $failure_closed ? false : null );
+			if ( is_array( $state ) && isset( $state['expires'] ) && (int) $state['expires'] > $now ) {
+				return $protected ? null : ( $failure_closed ? false : null );
+			}
 		}
 		if ( is_array( $state ) && isset( $state['expires'] ) && (int) $state['expires'] <= $now ) {
 			// Delete only the exact expired value observed above. A normal
@@ -158,6 +181,7 @@ final class SendRepute_Mail {
 
 		self::$active = true;
 		try {
+			$request['priceAuthorization'] = $price_authorization;
 			$response = SendRepute_Client::request( 'POST', '/v1/classify', $request );
 		} finally {
 			self::$active = false;
@@ -165,6 +189,21 @@ final class SendRepute_Mail {
 		if ( is_wp_error( $response ) ) {
 			$data   = $response->get_error_data();
 			$status = is_array( $data ) && isset( $data['status'] ) ? (int) $data['status'] : 0;
+			if ( 'sendrepute_api_price_changed' === $response->get_error_code() ) {
+				// Billing consent is narrower than fail-open delivery consent.
+				// Never deliver, retry, or silently authorize a raised tariff.
+				update_option(
+					$option_name,
+					array(
+						'status'        => 'price_changed',
+						'created'       => $now,
+						'expires'       => $now + self::TTL,
+						'authorization' => $authorization_digest,
+					),
+					false
+				);
+				return false;
+			}
 			if ( $status >= 400 && $status < 500 && 409 !== $status ) {
 				// These responses definitively rejected the request before paid
 				// work. Permit another attempt after the administrator fixes it.
@@ -176,7 +215,7 @@ final class SendRepute_Mail {
 			return $protected ? null : ( $failure_closed ? false : null );
 		}
 
-		$advisory = self::safe_advisory( $response );
+		$advisory = self::safe_advisory( $response, $price_authorization['maxChargeMillicents'] );
 		if ( is_wp_error( $advisory ) ) {
 			return $protected ? null : ( $failure_closed ? false : null );
 		}
@@ -320,12 +359,45 @@ final class SendRepute_Mail {
 	}
 
 	/**
+	 * Validate the deliberately stored variable-price authorization.
+	 *
+	 * @param array  $settings       Plugin settings.
+	 * @param string $token_identity Active credential identity.
+	 * @return array|WP_Error
+	 */
+	private static function price_authorization( $settings, $token_identity ) {
+		$fields  = array( 'classificationBaseMillicents', 'includedUniqueTerms', 'additionalTermMillicents', 'maximumClassificationMillicents' );
+		$pricing = isset( $settings['classification_pricing'] ) ? $settings['classification_pricing'] : null;
+		$maximum = isset( $settings['classification_max_charge_millicents'] ) ? $settings['classification_max_charge_millicents'] : null;
+		$consent_identity = isset( $settings['classification_consent_token_identity'] ) ? $settings['classification_consent_token_identity'] : '';
+		if ( ! is_string( $consent_identity ) ||
+			! preg_match( '/^[a-f0-9]{64}$/', $consent_identity ) ||
+			! hash_equals( $consent_identity, $token_identity ) ||
+			! is_array( $pricing ) ||
+			array_keys( $pricing ) !== $fields ||
+			! self::non_negative_integer( $maximum )
+		) {
+			return new WP_Error( 'sendrepute_price_consent_missing', __( 'Classification pricing has not been explicitly authorized.', 'sendrepute' ) );
+		}
+		foreach ( $fields as $field ) {
+			if ( ! self::non_negative_integer( $pricing[ $field ] ) ) {
+				return new WP_Error( 'sendrepute_price_consent_invalid', __( 'The authorized classification pricing is invalid.', 'sendrepute' ) );
+			}
+		}
+		return array(
+			'expectedPricing'     => $pricing,
+			'maxChargeMillicents' => $maximum,
+		);
+	}
+
+	/**
 	 * Reduce an API response to fields needed for local policy decisions.
 	 *
 	 * @param array $response API response.
+	 * @param int   $maximum  Authorized maximum for a new charge.
 	 * @return array|WP_Error
 	 */
-	private static function safe_advisory( $response ) {
+	private static function safe_advisory( $response, $maximum ) {
 		$models = array( 'thor', 'theos', 'athena', 'odin', 'freya', 'hermes', 'ares', 'apollo' );
 		if ( ! is_array( $response ) ||
 			! self::allowed_keys( $response, array( 'requestId', 'model', 'result', 'billing' ) ) ||
@@ -346,6 +418,7 @@ final class SendRepute_Mail {
 			! array_key_exists( 'replayed', $billing ) ||
 			! self::non_negative_integer( $billing['chargedMillicents'] ) ||
 			! is_bool( $billing['replayed'] ) ||
+			( ! $billing['replayed'] && $billing['chargedMillicents'] > $maximum ) ||
 			! isset( $result['label'], $result['spamProbability'], $result['confidence'], $result['reasons'], $result['flaggedTerms'], $result['analyzedFields'], $result['modelVersion'], $result['analyzedAt'] ) ||
 			! self::allowed_keys( $result, array( 'label', 'spamProbability', 'flaggedTermCount', 'confidence', 'reasons', 'flaggedTerms', 'analyzedFields', 'modelVersion', 'analyzedAt', 'contentAudit' ) ) ||
 			! in_array( $result['label'], array( 'inbox', 'spam' ), true ) ||

@@ -21,6 +21,9 @@ final class SendRepute_Client {
 		$defaults = array(
 			'enabled'        => false,
 			'paid_consent'   => false,
+			'classification_pricing' => array(),
+			'classification_max_charge_millicents' => -1,
+			'classification_consent_token_identity' => '',
 			'failure_policy' => 'open',
 			'risk_policy'    => 'advisory',
 			'threshold'      => 0.8,
@@ -272,11 +275,12 @@ final class SendRepute_Client {
 
 		$required_prices = array(
 			'classificationBaseMillicents',
+			'includedUniqueTerms',
 			'additionalTermMillicents',
 			'maximumClassificationMillicents',
 		);
 		foreach ( $required_prices as $field ) {
-			if ( ! isset( $pricing[ $field ] ) || ! is_numeric( $pricing[ $field ] ) || (float) $pricing[ $field ] < 0 ) {
+			if ( ! array_key_exists( $field, $pricing ) || ! is_int( $pricing[ $field ] ) || $pricing[ $field ] < 0 ) {
 				return new WP_Error( 'sendrepute_invalid_pricing', __( 'The SendRepute API returned invalid classification pricing.', 'sendrepute' ) );
 			}
 		}
